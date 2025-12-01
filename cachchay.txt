@@ -1,2 +1,7 @@
--File IAM.pickle em có xóa để up lên github,thường em để nó trong folder File
--Phần đg link dataset dạ là ở trong file params và file dataset(ở folder data)
+-File IAM.pickle em có xóa để up lên github,thường em để nó trong folder File(Em dùng dataset từ link https://drive.google.com/drive/folders/1ZgYS6-6l6fjKY75RJipONBByujIgf-uE)
+
+-Dạ phần đg link dataset là ở trong file params và file dataset(ở folder data)
+
+-Phần log lên wandb ở trong train em đã comment lại
+
+-Phần id để resume wandb em chưa chạy nên chưa có ạ
