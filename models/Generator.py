@@ -8,6 +8,10 @@ from util.util import PositionalEncoding, PosCNN
 from .blocks import Conv2dBlock, ResBlocks, ActFirstResBlock
 from .Unifront import UnifontModule
 from params import *
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -40,7 +44,7 @@ class Attention(nn.Module):
             .reshape(B, N, 3, self.num_heads, C // self.num_heads)
             .permute(2, 0, 3, 1, 4)
         )
-        q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv.unbind(0)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
@@ -89,88 +93,7 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         x = self.drop(x)
         return x
-class BlockWithDWConv(nn.Module):
-    def __init__(
-        self,
-        dim,
-        num_heads,
-        mlp_ratio=4.0,
-        qkv_bias=False,
-        drop=0.0,
-        attn_drop=0.0,
-        init_values=None,
-        drop_path=0.0,
-        act_layer=nn.GELU,
-        norm_layer=nn.LayerNorm,
-        spectral=False,
-        use_dwconv=True,  # Thêm tùy chọn DWConv
-        H=None,            # Chiều cao spatial
-        W=None,            # Chiều rộng spatial
-    ):
-        super().__init__()
-        self.norm1 = norm_layer(dim, elementwise_affine=True)
-        self.attn = Attention(
-            dim,
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            attn_drop=attn_drop,
-            proj_drop=drop,
-            spectral=spectral,
-        )
-        self.ls1 = (
-            LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
-        )
-        self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-        self.norm2 = norm_layer(dim, elementwise_affine=True)
-        self.mlp = Mlp(
-            in_features=dim,
-            hidden_features=int(dim * mlp_ratio),
-            act_layer=act_layer,
-            drop=drop,
-            spectral=spectral,
-        )
-        self.ls2 = (
-            LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
-        )
-        self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-
-        # Thêm DWConv branch
-        self.use_dwconv = use_dwconv
-        if use_dwconv:
-            self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
-            self.bn_dwconv = nn.BatchNorm2d(dim)
-            self.act_dwconv = act_layer()
-            self.H = H
-            self.W = W
-
-    def forward(self, x):
-        B, N, C = x.shape
-        
-        # Main transformer path
-        x_transformer = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
-        x_transformer = x_transformer + self.drop_path2(self.ls2(self.mlp(self.norm2(x_transformer))))
-        
-        # DWConv parallel path (nếu được kích hoạt)
-        if self.use_dwconv and self.H is not None and self.W is not None:
-            # Reshape để áp dụng conv 2D: (B, N, C) -> (B, H, W, C) -> (B, C, H, W)
-            x_conv = x_transformer.reshape(B, self.H, self.W, C).permute(0, 3, 1, 2)
-            
-            # Áp dụng depthwise convolution
-            x_conv = self.dwconv(x_conv)
-            x_conv = self.bn_dwconv(x_conv)
-            x_conv = self.act_dwconv(x_conv)
-            
-            # Reshape trở lại: (B, C, H, W) -> (B, H, W, C) -> (B, N, C)
-            x_conv = x_conv.permute(0, 2, 3, 1).reshape(B, N, C)
-            
-            # Fusion: kết hợp transformer path và conv path
-            x = x_transformer + x_conv
-        else:
-            x = x_transformer
-            print("Not using DWConv path generator")
-            
-        return x
 def DropPath(x, drop_prob: float = 0., training: bool = False):
     if drop_prob == 0. or not training:
         return x
@@ -192,6 +115,102 @@ class DropPath(nn.Module):
 def spectral_norm(module):
     return nn.utils.spectral_norm(module)
 
+class BlockWithDWConv(nn.Module):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        mlp_ratio=4.0,
+        qkv_bias=False,
+        drop=0.0,
+        attn_drop=0.0,
+        init_values=None,
+        drop_path=0.0,
+        act_layer=nn.GELU,
+        norm_layer=nn.LayerNorm,
+        spectral=False,
+        use_dwconv=True,
+        H=None,
+        W=None,
+    ):
+        super().__init__()
+        self.use_dwconv = use_dwconv
+        self.H = H
+        self.W = W
+
+        # PAPER: PreNorm architecture
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+            spectral=spectral,
+        )
+        self.ls1 = LayerScale(dim, init_values) if init_values else nn.Identity()
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        self.norm2 = norm_layer(dim)
+        self.mlp = Mlp(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            drop=drop,
+            spectral=spectral,
+        )
+        self.ls2 = LayerScale(dim, init_values) if init_values else nn.Identity()
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        # PAPER: DWConv bypass from INPUT
+        if use_dwconv:
+            self.gelu_dw = act_layer()
+            self.bn_dwconv = nn.BatchNorm2d(dim)
+            self.dwconv = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
+            # CRITICAL: Learnable scaling for stable fusion
+            self.gamma = nn.Parameter(1e-6 * torch.ones(1, 1, dim))
+
+    def forward(self, x, H=None, W=None):
+        B, N, C = x.shape
+        H = H or self.H
+        W = W or self.W
+
+        # PAPER: Take shortcut from INPUT (not output)
+        shortcut = 0
+        if self.use_dwconv and H is not None and W is not None:
+            # Handle cls token (N == H*W + 1 means has cls token at position 0)
+            if N == H * W + 1:
+                shortcut = x[:, 1:]  # Remove cls token
+                has_cls = True
+            else:
+                shortcut = x
+                has_cls = False
+
+            # Reshape for conv
+            shortcut = shortcut.reshape(B, H, W, C).permute(0, 3, 1, 2)
+
+            # PAPER ORDER: GELU -> BN -> Conv
+            shortcut = self.gelu_dw(shortcut)
+            shortcut = self.bn_dwconv(shortcut)
+            shortcut = self.dwconv(shortcut)
+
+            # Reshape back
+            shortcut = shortcut.permute(0, 2, 3, 1).reshape(B, -1, C)
+
+            # Add zero cls token back if removed
+            if has_cls:
+                cls_token = torch.zeros(B, 1, C, device=x.device, dtype=x.dtype)
+                shortcut = torch.cat([cls_token, shortcut], dim=1)
+
+        # PAPER: PreNorm paths
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+
+        # PAPER: Add shortcut with learnable scaling
+        x = x + self.gamma * shortcut
+
+        return x
+
 #DWConv Generator
 class Generator(nn.Module):
     def __init__(
@@ -204,7 +223,7 @@ class Generator(nn.Module):
         drop=0.0,
         norm_layer=nn.LayerNorm,
         max_num_patch=100,
-        use_dwconv=True,  # Thêm tùy chọn DWConv
+        use_dwconv=True,
     ):
         super().__init__()
 
@@ -215,7 +234,8 @@ class Generator(nn.Module):
         self.embed_dim = [128, 128, 64, 64, 32, 32, 16]
         num_block = 4
         self.use_dwconv = use_dwconv
-        
+
+        # Assuming PositionalEncoding and UnifontModule are defined elsewhere
         self.pos_enc = PositionalEncoding(embed_dim, drop, max_num_patch)
         self.query_embed = UnifontModule(
             embed_dim,
@@ -256,8 +276,8 @@ class Generator(nn.Module):
                     drop=drop,
                     attn_drop=drop,
                     norm_layer=norm_layer,
-                    use_dwconv=use_dwconv,  # Bật DWConv
-                    H=None,  # Sẽ được cập nhật trong forward
+                    use_dwconv=use_dwconv,
+                    H=None,
                     W=None,
                 )
                 for i in range(depth)
@@ -281,7 +301,7 @@ class Generator(nn.Module):
                     drop=drop,
                     attn_drop=drop,
                     norm_layer=norm_layer,
-                    use_dwconv=use_dwconv,  # Bật DWConv
+                    use_dwconv=use_dwconv,
                     H=None,
                     W=None,
                 )
@@ -306,7 +326,7 @@ class Generator(nn.Module):
                     drop=drop,
                     attn_drop=drop,
                     norm_layer=norm_layer,
-                    use_dwconv=use_dwconv,  # Bật DWConv
+                    use_dwconv=use_dwconv,
                     H=None,
                     W=None,
                 )
@@ -315,12 +335,14 @@ class Generator(nn.Module):
         )
         self.layer_norm5 = nn.LayerNorm(self.embed_dim[index])
 
+        # Assuming PosCNN is defined elsewhere
         self.pos_block = nn.ModuleList([PosCNN(i, i) for i in self.embed_dim])
         self.norm = norm_layer(embed_dim, elementwise_affine=True)
         self.noise = torch.distributions.Normal(
             loc=torch.tensor([0.0]), scale=torch.tensor([1.0])
         )
 
+        # Assuming ResBlocks and Conv2dBlock are defined elsewhere
         self.deconv = nn.Sequential(
             ResBlocks(
                 2, self.embed_dim[index], norm="in", activation="relu", pad_type="reflect"
@@ -377,7 +399,7 @@ class Generator(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-        elif isinstance(m, nn.BatchNorm2d):  # Thêm khởi tạo cho BatchNorm2d của DWConv
+        elif isinstance(m, nn.BatchNorm2d):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
@@ -403,17 +425,18 @@ class Generator(nn.Module):
 
         tgt = self.conv_1(tgt)
         b, c, h, w = tgt.shape
-        
+
         # Cập nhật kích thước spatial cho blocks_3
         if self.use_dwconv:
             for blk in self.blocks_3:
                 blk.H = h
                 blk.W = w
-                
+
         tgt = tgt.view(b, c, -1).permute(0, 2, 1)
 
+        # FIX: Pass h, w to block forward
         for j, blk in enumerate(self.blocks_3):
-            tgt = blk(tgt)
+            tgt = blk(tgt, h, w)  # PASS SPATIAL DIMS!
             if j == 0:
                 tgt = self.pos_block[2](tgt, h, w)
         tgt = self.layer_norm3(tgt).permute(0, 2, 1).view(b, self.embed_dim[2], h, w)
@@ -421,17 +444,17 @@ class Generator(nn.Module):
 
         tgt = self.conv_2(tgt)
         b, c, h, w = tgt.shape
-        
+
         # Cập nhật kích thước spatial cho blocks_4
         if self.use_dwconv:
             for blk in self.blocks_4:
                 blk.H = h
                 blk.W = w
-                
+
         tgt = tgt.view(b, c, -1).permute(0, 2, 1)
 
         for j, blk in enumerate(self.blocks_4):
-            tgt = blk(tgt)
+            tgt = blk(tgt, h, w)  # PASS SPATIAL DIMS!
             if j == 0:
                 tgt = self.pos_block[3](tgt, h, w)
         tgt = self.layer_norm4(tgt).permute(0, 2, 1).view(b, self.embed_dim[3], h, w)
@@ -439,17 +462,17 @@ class Generator(nn.Module):
 
         tgt = self.conv_3(tgt)
         b, c, h, w = tgt.shape
-        
+
         # Cập nhật kích thước spatial cho blocks_5
         if self.use_dwconv:
             for blk in self.blocks_5:
                 blk.H = h
                 blk.W = w
-                
+
         tgt = tgt.view(b, c, -1).permute(0, 2, 1)
 
         for j, blk in enumerate(self.blocks_5):
-            tgt = blk(tgt)
+            tgt = blk(tgt, h, w)  # PASS SPATIAL DIMS!
             if j == 0:
                 tgt = self.pos_block[4](tgt, h, w)
         tgt = self.layer_norm5(tgt).permute(0, 2, 1).view(b, self.embed_dim[4], h, w)
